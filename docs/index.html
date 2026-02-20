@@ -65,9 +65,10 @@
   </div>
 
   <script>
-    // The address of your local backend server.
-    // When you run "uvicorn main:app --reload", it starts at this address.
-    const API_BASE = "http://localhost:8000";
+    // Backend server address.
+    // For local use: "http://localhost:8000"
+    // For live site: replace with your Railway URL, e.g. "https://xxxx.up.railway.app"
+    const API_BASE = "RAILWAY_URL_HERE";
 
     async function analyzePost() {
       const text = document.getElementById("post-text").value.trim();

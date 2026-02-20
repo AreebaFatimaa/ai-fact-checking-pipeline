@@ -24,6 +24,11 @@ from urllib.parse import urlparse
 SESSIONS_DIR = os.path.join(os.path.dirname(__file__), "sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
+# On Railway (a remote server), there is no screen to show a browser window.
+# When ENVIRONMENT=production, browser-based scrapers return a clear message
+# instead of crashing. Set this variable in Railway's dashboard.
+IS_SERVER = os.environ.get("ENVIRONMENT") == "production"
+
 
 # ---------------------------------------------------------------------------
 # Platform detection
@@ -204,6 +209,15 @@ def scrape_playwright(url: str, platform: str) -> dict:
 
     The browser window closes automatically once content is extracted.
     """
+    # On a remote server there is no display — browser automation requires
+    # a screen. Direct the user to paste the text manually instead.
+    if IS_SERVER:
+        return _error_result(
+            platform,
+            f"Scraping {platform.title()} requires a logged-in browser session, which only works "
+            f"in the desktop version of this tool. Please copy and paste the post text manually."
+        )
+
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
     except ImportError:
