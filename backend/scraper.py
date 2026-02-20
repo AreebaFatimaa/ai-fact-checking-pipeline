@@ -305,6 +305,25 @@ def _extract_twitter(page, url: str) -> dict:
     """Extract text, images, and video flag from a Twitter/X post."""
     from playwright.sync_api import TimeoutError as PWTimeout
 
+    # X often shows a "sign in to continue" modal over public tweets.
+    # The modal doesn't change the URL, so we check for it directly and
+    # try to close it before extracting content.
+    page.wait_for_timeout(2000)
+    dismiss_selectors = [
+        '[data-testid="sheetDialog"] [aria-label="Close"]',
+        '[aria-label="Close"]',
+        '[data-testid="app-bar-close"]',
+    ]
+    for selector in dismiss_selectors:
+        btn = page.query_selector(selector)
+        if btn:
+            try:
+                btn.click()
+                page.wait_for_timeout(1000)
+                break
+            except Exception:
+                pass
+
     try:
         page.wait_for_selector('article[data-testid="tweet"]', timeout=15000)
     except PWTimeout:
