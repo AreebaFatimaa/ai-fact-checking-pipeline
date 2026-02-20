@@ -1,0 +1,21 @@
+# Never commit secrets
+backend/.env
+
+# Browser login sessions (contain cookies — treat like passwords)
+backend/sessions/
+
+# Python bytecode — compiled files, not needed in git
+__pycache__/
+*.pyc
+*.pyo
+
+# Local reference documents — not part of the codebase
+*.pdf
+list.txt
+
+# macOS system files
+.DS_Store
+
+# Editor
+.vscode/
+.claude/

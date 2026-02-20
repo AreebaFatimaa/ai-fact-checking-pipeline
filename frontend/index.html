@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Fact-Checking Pipeline</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <div class="container">
+
+    <header>
+      <h1>AI Fact-Checking Pipeline</h1>
+      <p class="subtitle">
+        Extract and classify factual claims from social media posts,
+        aligned with IFCN Code of Principles.
+      </p>
+    </header>
+
+    <!-- Input section -->
+    <section class="card input-section">
+      <div class="field">
+        <label for="post-url">Post URL <span class="optional">(paste a URL to auto-fetch the post)</span></label>
+        <input type="text" id="post-url" placeholder="https://x.com/  or  reddit.com/  or  youtube.com/  …" />
+      </div>
+
+      <div class="field">
+        <label for="post-text">
+          Or paste post text manually
+          <span class="optional">(used only if no URL is provided above)</span>
+        </label>
+        <textarea
+          id="post-text"
+          rows="6"
+          placeholder="Paste the full text of the social media post here if you're not using a URL…"
+        ></textarea>
+      </div>
+
+      <button id="analyze-btn" onclick="analyzePost()">Analyze Claims</button>
+
+      <p class="browser-note">
+        For X/Twitter, Instagram, and Facebook: a browser window will open.
+        Log in if prompted — your session will be saved for future use.
+      </p>
+    </section>
+
+    <!-- Loading indicator -->
+    <div id="loading" class="loading hidden">
+      <span id="loading-msg">Fetching post — a browser window may have opened. Log in if prompted, then wait…</span>
+    </div>
+
+    <!-- Error display -->
+    <div id="error-box" class="error-box hidden"></div>
+
+    <!-- Results section -->
+    <section id="results" class="hidden">
+      <h2>Analysis Results</h2>
+
+      <div id="summary-box" class="summary-box"></div>
+
+      <div id="claims-list"></div>
+    </section>
+
+  </div>
+
+  <script>
+    // The address of your local backend server.
+    // When you run "uvicorn main:app --reload", it starts at this address.
+    const API_BASE = "http://localhost:8000";
+
+    async function analyzePost() {
+      const text = document.getElementById("post-text").value.trim();
+      const url  = document.getElementById("post-url").value.trim();
+
+      if (!url && !text) {
+        showError("Please provide a URL or paste the post text.");
+        return;
+      }
+
+      // Update loading message based on what we're doing
+      const loadingMsg = document.getElementById("loading-msg");
+      if (url) {
+        loadingMsg.textContent = "Fetching post — a browser window may open for login. Wait for it to close automatically…";
+      } else {
+        loadingMsg.textContent = "Analyzing text — this may take 15–30 seconds…";
+      }
+
+      setLoading(true);
+      clearResults();
+
+      try {
+        const response = await fetch(`${API_BASE}/analyze`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, url }),
+          // Scraping can take up to 2 minutes (login window), so extend the timeout
+          signal: AbortSignal.timeout(180000),
+        });
+
+        if (!response.ok) {
+          throw new Error(`Server responded with status ${response.status}`);
+        }
+
+        const data = await response.json();
+        displayResults(data);
+
+      } catch (err) {
+        showError(
+          `Could not reach the analysis server.\n\n` +
+          `Make sure the backend is running (see setup instructions).\n\n` +
+          `Error: ${err.message}`
+        );
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    function displayResults(data) {
+      document.getElementById("results").classList.remove("hidden");
+
+      // If there was a top-level error (e.g. scraping failed), show it and stop
+      if (data.error && data.claims && data.claims.length === 0) {
+        showError(data.error);
+        document.getElementById("results").classList.add("hidden");
+        return;
+      }
+
+      // Show what was scraped (if anything)
+      const summaryBox = document.getElementById("summary-box");
+      let summaryHtml = "";
+
+      if (data.scraped) {
+        const s = data.scraped;
+        const platform = s.platform ? s.platform.charAt(0).toUpperCase() + s.platform.slice(1) : "Unknown";
+        const imageCount = (s.image_urls || []).length;
+        const videoCount = (s.video_urls || []).length;
+        const mediaNote = [
+          imageCount ? `${imageCount} image${imageCount > 1 ? "s" : ""}` : "",
+          videoCount ? `${videoCount} video${videoCount > 1 ? "s" : ""}` : "",
+        ].filter(Boolean).join(", ");
+
+        summaryHtml += `
+          <div class="scraped-banner">
+            <strong>Fetched from ${escapeHtml(platform)}</strong>
+            ${s.author ? `· by <em>${escapeHtml(s.author)}</em>` : ""}
+            ${mediaNote ? `· ${escapeHtml(mediaNote)} detected` : ""}
+          </div>
+          <details class="scraped-text">
+            <summary>View extracted text</summary>
+            <pre>${escapeHtml(s.text || "(no text extracted)")}</pre>
+          </details>
+        `;
+      }
+
+      summaryHtml += `<p><strong>Overall assessment:</strong> ${escapeHtml(data.summary || "No summary provided.")}</p>`;
+      summaryBox.innerHTML = summaryHtml;
+
+      if (data.error) {
+        summaryBox.innerHTML += `<p class="parse-error">⚠ ${escapeHtml(data.error)}</p>`;
+      }
+
+      // Claims
+      const claimsList = document.getElementById("claims-list");
+      if (!data.claims || data.claims.length === 0) {
+        claimsList.innerHTML = "<p class='no-claims'>No specific factual claims were extracted from this post.</p>";
+        return;
+      }
+
+      data.claims.forEach((claim, i) => {
+        const card = document.createElement("div");
+        // Normalize category string to a CSS-safe class name
+        const categoryClass = (claim.category || "unclassified")
+          .toLowerCase()
+          .replace(/[\s/]+/g, "-");
+
+        const mediaLabels = (claim.media_labels || [])
+          .map(label => `<span class="media-tag">${escapeHtml(label)}</span>`)
+          .join("");
+
+        card.className = `claim-card cat-${categoryClass}`;
+        card.innerHTML = `
+          <div class="claim-header">
+            <span class="claim-num">Claim ${i + 1}</span>
+            <span class="cat-badge cat-badge-${categoryClass}">${escapeHtml(claim.category || "unclassified")}</span>
+            <span class="confidence">Confidence: ${escapeHtml(claim.confidence || "—")}</span>
+          </div>
+          <p class="claim-text">&ldquo;${escapeHtml(claim.claim_text || "")}&rdquo;</p>
+          <p class="reasoning">${escapeHtml(claim.reasoning || "")}</p>
+          ${mediaLabels ? `<div class="media-labels">${mediaLabels}</div>` : ""}
+        `;
+        claimsList.appendChild(card);
+      });
+    }
+
+    function showError(msg) {
+      const box = document.getElementById("error-box");
+      box.textContent = msg;
+      box.classList.remove("hidden");
+    }
+
+    function clearResults() {
+      document.getElementById("results").classList.add("hidden");
+      document.getElementById("error-box").classList.add("hidden");
+      document.getElementById("summary-box").innerHTML = "";
+      document.getElementById("claims-list").innerHTML = "";
+    }
+
+    function setLoading(show) {
+      document.getElementById("loading").classList.toggle("hidden", !show);
+      document.getElementById("analyze-btn").disabled = show;
+    }
+
+    // Prevent XSS: escape any HTML special characters before inserting into the DOM
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+  </script>
+
+</body>
+</html>

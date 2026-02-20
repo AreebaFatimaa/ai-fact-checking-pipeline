@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+anthropic
+python-dotenv
+pydantic
+requests
+yt-dlp
+youtube-transcript-api
+playwright
