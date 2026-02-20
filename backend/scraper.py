@@ -270,6 +270,7 @@ def scrape_playwright(url: str, platform: str) -> dict:
                 return _error_result(platform, "Login timed out (90 seconds). Please try again.")
 
         # Extract content using platform-specific logic
+        print(f"[scraper] Page loaded. URL: {page.url}")
         try:
             if platform == "twitter":
                 result = _extract_twitter(page, url)
@@ -282,6 +283,7 @@ def scrape_playwright(url: str, platform: str) -> dict:
         except Exception as e:
             result = {"error": f"Content extraction failed: {e}"}
 
+        print(f"[scraper] Extraction result: text_length={len(result.get('text',''))}, error={result.get('error')}")
         browser.close()
 
     return {
