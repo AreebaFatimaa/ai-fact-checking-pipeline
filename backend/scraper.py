@@ -6,18 +6,21 @@ Each scraper returns a standardized dict so the rest of the pipeline
 doesn't need to know which platform it's dealing with.
 
 Supported platforms:
-  - Reddit      → public JSON API (no login, very reliable)
-  - YouTube     → yt-dlp + youtube-transcript-api (no login, reliable)
-  - X/Twitter   → Playwright browser automation (login required first time)
-  - Instagram   → Playwright browser automation (login required first time)
-  - Facebook    → Playwright browser automation (login required first time)
+  - Reddit      -> public JSON API (no login, very reliable)
+  - YouTube     -> yt-dlp + youtube-transcript-api (no login, reliable)
+  - X/Twitter   -> Playwright browser automation (login required first time)
+  - Instagram   -> Playwright browser automation (login required first time)
+  - Facebook    -> Playwright browser automation (login required first time)
 """
 
+import logging
 import os
 import re
 import json
 import requests
 from urllib.parse import urlparse
+
+logger = logging.getLogger("factcheck.scraper")
 
 # Sessions directory: Playwright saves login cookies here so the user
 # only needs to log in once per platform.
@@ -29,6 +32,15 @@ os.makedirs(SESSIONS_DIR, exist_ok=True)
 # instead of crashing. Set this variable in Railway's dashboard.
 IS_SERVER = os.environ.get("ENVIRONMENT") == "production"
 
+# Allowed domains per platform for SSRF protection
+PLATFORM_DOMAINS = {
+    "reddit": {"reddit.com", "www.reddit.com", "old.reddit.com"},
+    "youtube": {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"},
+    "twitter": {"twitter.com", "x.com", "mobile.twitter.com", "www.twitter.com", "www.x.com"},
+    "instagram": {"instagram.com", "www.instagram.com"},
+    "facebook": {"facebook.com", "www.facebook.com", "m.facebook.com", "fb.com", "www.fb.com"},
+}
+
 
 # ---------------------------------------------------------------------------
 # Platform detection
@@ -39,7 +51,8 @@ def detect_platform(url: str) -> str:
     Infer the social media platform from a URL.
     Returns one of: "twitter", "reddit", "youtube", "instagram", "facebook", "unknown"
     """
-    host = urlparse(url.lower()).netloc.replace("www.", "")
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().replace("www.", "")
 
     if host in ("twitter.com", "x.com", "mobile.twitter.com"):
         return "twitter"
@@ -55,6 +68,14 @@ def detect_platform(url: str) -> str:
         return "unknown"
 
 
+def _validate_domain(url: str, platform: str) -> bool:
+    """Check that the URL's host belongs to the expected platform."""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    allowed = PLATFORM_DOMAINS.get(platform, set())
+    return host in allowed
+
+
 # ---------------------------------------------------------------------------
 # Main dispatcher
 # ---------------------------------------------------------------------------
@@ -67,7 +88,13 @@ def scrape(url: str) -> dict:
     platform = detect_platform(url)
 
     if platform == "unknown":
-        return _error_result("unknown", f"Unrecognized URL. Supported: X/Twitter, Reddit, YouTube, Instagram, Facebook.")
+        return _error_result("unknown", "Unrecognized URL. Supported: X/Twitter, Reddit, YouTube, Instagram, Facebook.")
+
+    if not _validate_domain(url, platform):
+        logger.warning("SSRF blocked: URL %s does not match expected domains for %s", url, platform)
+        return _error_result(platform, "URL does not match expected domain for this platform.")
+
+    logger.info("Scraping %s URL: %s", platform, url)
 
     scrapers = {
         "reddit":    scrape_reddit,
@@ -92,15 +119,20 @@ def scrape_reddit(url: str) -> dict:
     Reddit exposes a JSON API for any post: just append .json to the URL.
     No login or browser automation needed.
     """
-    # Strip query parameters and trailing slashes, then add .json
     clean_url = url.split("?")[0].rstrip("/") + ".json"
+
+    # Re-validate the constructed URL to prevent SSRF via redirect
+    parsed = urlparse(clean_url)
+    if parsed.netloc.lower() not in PLATFORM_DOMAINS["reddit"]:
+        return _error_result("reddit", "URL does not point to reddit.com")
 
     headers = {"User-Agent": "FactCheckPipeline/1.0 (educational journalism tool)"}
 
     try:
-        response = requests.get(clean_url, headers=headers, timeout=15)
+        response = requests.get(clean_url, headers=headers, timeout=15, allow_redirects=False)
         response.raise_for_status()
     except requests.RequestException as e:
+        logger.error("Reddit fetch failed: %s", e)
         return _error_result("reddit", f"Could not fetch Reddit post: {e}")
 
     try:
@@ -164,7 +196,14 @@ def scrape_youtube(url: str) -> dict:
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        logger.error("yt-dlp download error for %s: %s", url, e)
+        return _error_result("youtube", f"Could not fetch YouTube video info: {e}")
+    except yt_dlp.utils.ExtractorError as e:
+        logger.error("yt-dlp extractor error for %s: %s", url, e)
+        return _error_result("youtube", f"Could not extract YouTube video info: {e}")
     except Exception as e:
+        logger.error("Unexpected yt-dlp error for %s: %s", url, e)
         return _error_result("youtube", f"Could not fetch YouTube video info: {e}")
 
     title       = info.get("title", "")
@@ -181,8 +220,12 @@ def scrape_youtube(url: str) -> dict:
         segments = YouTubeTranscriptApi.get_transcript(video_id)
         transcript = " ".join(s["text"] for s in segments)[:4000]  # Cap length
         text += f"\n\nVideo transcript:\n{transcript}"
-    except Exception:
-        text += "\n\n[No captions or transcript available for this video]"
+    except ImportError:
+        logger.warning("youtube-transcript-api not installed")
+        text += "\n\n[youtube-transcript-api not installed]"
+    except Exception as exc:
+        logger.warning("Transcript retrieval failed for %s: %s", video_id, exc)
+        text += "\n\n[Transcript retrieval failed]"
 
     return {
         "platform":   "youtube",
@@ -209,8 +252,6 @@ def scrape_playwright(url: str, platform: str) -> dict:
 
     The browser window closes automatically once content is extracted.
     """
-    # On a remote server there is no display — browser automation requires
-    # a screen. Direct the user to paste the text manually instead.
     if IS_SERVER:
         return _error_result(
             platform,
@@ -226,9 +267,6 @@ def scrape_playwright(url: str, platform: str) -> dict:
     session_dir = os.path.join(SESSIONS_DIR, platform)
 
     with sync_playwright() as p:
-        # launch_persistent_context saves/restores cookies from session_dir.
-        # headless=False means the browser window is visible to the user.
-        # The AutomationControlled flag reduces the chance platforms detect us as a bot.
         browser = p.chromium.launch_persistent_context(
             user_data_dir=session_dir,
             headless=False,
@@ -242,17 +280,20 @@ def scrape_playwright(url: str, platform: str) -> dict:
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
         except Exception as e:
             browser.close()
+            logger.error("Page load failed for %s: %s", url, e)
             return _error_result(platform, f"Page failed to load: {e}")
 
-        # Give the page a moment to redirect (e.g. to a login wall)
-        page.wait_for_timeout(3000)
+        # Wait for page to settle (redirects, lazy loading)
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass  # Fall through — networkidle is best-effort
 
         # If we've landed on a login page, wait for the user to log in manually
         if _is_login_page(page.url, platform):
             print(f"\n>>> Please log in to {platform.title()} in the browser window.")
             print(f">>> Waiting up to 90 seconds. The window will close automatically after login.\n")
             try:
-                # Poll until the URL no longer looks like a login page
                 page.wait_for_function(
                     """() => {
                         const url = window.location.href.toLowerCase();
@@ -261,30 +302,32 @@ def scrape_playwright(url: str, platform: str) -> dict:
                     }""",
                     timeout=90000,
                 )
-                page.wait_for_timeout(3000)
-                # Navigate to the original URL now that we're logged in
+                page.wait_for_load_state("networkidle", timeout=10000)
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(3000)
+                page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
                 browser.close()
                 return _error_result(platform, "Login timed out (90 seconds). Please try again.")
 
         # Extract content using platform-specific logic
-        print(f"[scraper] Page loaded. URL: {page.url}")
-        try:
-            if platform == "twitter":
-                result = _extract_twitter(page, url)
-            elif platform == "instagram":
-                result = _extract_instagram(page, url)
-            elif platform == "facebook":
-                result = _extract_facebook(page, url)
-            else:
-                result = {}
-        except Exception as e:
-            result = {"error": f"Content extraction failed: {e}"}
+        logger.info("Page loaded for %s. URL: %s", platform, page.url)
 
-        print(f"[scraper] Extraction result: text_length={len(result.get('text',''))}, error={result.get('error')}")
-        browser.close()
+        extractors = {
+            "twitter":   _extract_twitter,
+            "instagram": _extract_instagram,
+            "facebook":  _extract_facebook,
+        }
+        extractor = extractors.get(platform)
+
+        try:
+            result = extractor(page, url) if extractor else {}
+        except Exception as e:
+            logger.error("Content extraction failed for %s: %s", platform, e)
+            result = {"error": f"Content extraction failed: {e}"}
+        finally:
+            logger.info("Extraction result: text_length=%d, error=%s",
+                         len(result.get("text", "")), result.get("error"))
+            browser.close()
 
     return {
         "platform":   platform,
@@ -308,9 +351,11 @@ def _extract_twitter(page, url: str) -> dict:
     from playwright.sync_api import TimeoutError as PWTimeout
 
     # X often shows a "sign in to continue" modal over public tweets.
-    # The modal doesn't change the URL, so we check for it directly and
-    # try to close it before extracting content.
-    page.wait_for_timeout(2000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=5000)
+    except Exception:
+        pass
+
     dismiss_selectors = [
         '[data-testid="sheetDialog"] [aria-label="Close"]',
         '[aria-label="Close"]',
@@ -337,16 +382,13 @@ def _extract_twitter(page, url: str) -> dict:
     author_el = page.query_selector('[data-testid="User-Name"]')
     author    = author_el.inner_text().split("\n")[0] if author_el else ""
 
-    # Images: Twitter serves images from pbs.twimg.com
     image_urls = []
     for img in page.query_selector_all('[data-testid="tweetPhoto"] img'):
         src = img.get_attribute("src") or ""
         if "pbs.twimg.com" in src:
-            # Request the large version instead of the thumbnail
             src = re.sub(r"&name=\w+$", "&name=large", src)
             image_urls.append(src)
 
-    # Video: just note the post URL as the video source for now
     video_urls = []
     if page.query_selector('[data-testid="videoComponent"]'):
         video_urls.append(url)
@@ -356,10 +398,11 @@ def _extract_twitter(page, url: str) -> dict:
 
 def _extract_instagram(page, url: str) -> dict:
     """Extract content from an Instagram post using Open Graph meta tags."""
-    page.wait_for_timeout(2000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=5000)
+    except Exception:
+        pass
 
-    # Open Graph tags are the most reliable way to get content from Instagram.
-    # These are machine-readable metadata tags in the page's <head>.
     og_desc  = page.query_selector('meta[property="og:description"]')
     og_image = page.query_selector('meta[property="og:image"]')
     og_type  = page.query_selector('meta[property="og:type"]')
@@ -373,7 +416,10 @@ def _extract_instagram(page, url: str) -> dict:
 
 def _extract_facebook(page, url: str) -> dict:
     """Extract content from a Facebook post using Open Graph meta tags."""
-    page.wait_for_timeout(2000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=5000)
+    except Exception:
+        pass
 
     og_title = page.query_selector('meta[property="og:title"]')
     og_desc  = page.query_selector('meta[property="og:description"]')
